@@ -28,6 +28,29 @@ BarWidget {
   id: root
   moduleName: "so.den"
 
+  // Omarchy 4.0.3 (2026-09-09, basecamp/omarchy PR #9618 — a security fix
+  // for a responsibly-disclosed auth-service exposure) sandboxed the API
+  // given to third-party plugins. `root.bar` for a third-party widget is now
+  // a `PluginBarApi` (Ui/PluginBarApi.qml) with no `shellConfig`, no
+  // `barConfig`, and no `pluginRegistry` at all — only a read-only snapshot
+  // via `layoutConfig` (== the old `shellConfig.bar.layout`). This is
+  // narrower than github.com/SaifOmar/so.den#5's suggested `bar.barConfig`
+  // fix, which does not exist on the facade actually shipped in 4.0.3
+  // (verified against /usr/share/omarchy/shell/{shell.qml,Ui/PluginBarApi.qml,
+  // plugins/bar/Bar.qml} directly).
+  //
+  // Writes (`shell.mutateShellConfig`) are separately gated behind a "bar"
+  // kind in the plugin's manifest (see plugins/bar/README.md — reserved for
+  // full alternative bar engines like the stock `omarchy.bar`, not ordinary
+  // bar-widget plugins), which Den cannot legitimately declare. So this
+  // restores READS only: the drawer shows what is already saved in
+  // shell.json again. persistWidgets() and friends below still silently
+  // no-op on write — see their comments.
+  function denLayout() {
+    var l = root.bar && root.bar.layoutConfig
+    return l ? { bar: { layout: l }, plugins: [] } : null
+  }
+
   // --- shared lookups --------------------------------------------------------
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -54,8 +77,7 @@ BarWidget {
     var rev = root.manageRevision
     void rev
     var list = null
-    var shell = root.bar && root.bar.shell
-    var config = shell ? shell.shellConfig : null
+    var config = root.denLayout()
     if (config && config.bar && config.bar.layout) {
       var sections = DenModel.sections()
       for (var s = 0; s < sections.length; s++) {
@@ -98,8 +120,7 @@ BarWidget {
   // mirroring how Bar.qml injects settings; falls back to manifest defaults.
   function settingsFor(id) {
     void root.manageRevision
-    var shell = root.bar && root.bar.shell
-    var s = shell ? DenModel.entrySettings(shell.shellConfig, id) : null
+    var s = DenModel.entrySettings(root.denLayout(), id)
     return s !== null ? s : root.defaultsFor(id)
   }
 
@@ -122,8 +143,10 @@ BarWidget {
   }
 
   function pluginManifest(id) {
-    var reg = root.bar && root.bar.shell && root.bar.shell.pluginRegistry
-    return reg && reg.installedPlugins ? (reg.installedPlugins[String(id || "")] || null) : null
+    // No pluginRegistry reachable from a third-party plugin under 4.0.3 (see
+    // denLayout() above) — displayName()/defaultsFor() fall back to id/{}
+    // for anything not already in registryWidgets (i.e. not mounted).
+    return null
   }
 
   // --- tray state ------------------------------------------------------------
@@ -131,9 +154,7 @@ BarWidget {
   readonly property var trayState: {
     var rev = root.manageRevision
     void rev
-    var shell = root.bar && root.bar.shell
-    var config = shell ? shell.shellConfig : null
-    return DenModel.trayEntrySettings(config)
+    return DenModel.trayEntrySettings(root.denLayout())
   }
 
   readonly property var trayPinnedIds: DenModel.stringList(trayState.pinned)
@@ -834,7 +855,14 @@ BarWidget {
   // exactly on our slot makes the bar try to reorder next to us first, which
   // is a safe no-op once the module left the layout.
 
-  readonly property bool extDragActive: root.bar ? root.bar.barDragSource !== null : false
+  // `barDragSource`/`barDragSceneX`/`barDragSceneY` do not exist on the
+  // sandboxed PluginBarApi (Ui/PluginBarApi.qml) under Omarchy 4.0.3 (see
+  // denLayout() near the top) — `root.bar.barDragSource` is `undefined`,
+  // and `undefined !== null` is true, so this used to get stuck permanently
+  // "active" instead of reading as no-drag. Dragging an external bar widget
+  // onto Den to tuck it away is not observable through this facade at all
+  // right now; hardcoded off rather than leaving that stuck-true bug.
+  readonly property bool extDragActive: false
   property string extDragId: ""
   property bool extOverZone: false
 
@@ -898,11 +926,10 @@ BarWidget {
       && y <= cardY + ch
   }
 
-  Connections {
-    target: root.bar
-    function onBarDragSceneXChanged() { root.updateExtZone() }
-    function onBarDragSceneYChanged() { root.updateExtZone() }
-  }
+  // No onBarDragSceneXChanged/YChanged to connect to any more — PluginBarApi
+  // never had those signals under 4.0.3 (extDragActive above), and binding
+  // to them just produced "no signal of the target matches the name"
+  // warnings on every load for a path that could never fire anyway.
 
   // --- icons -------------------------------------------------------------------
   //
@@ -2075,15 +2102,14 @@ BarWidget {
   // drawer can mount it. Showing it does the reverse.
 
   function layoutHasId(id) {
-    var shell = root.bar && root.bar.shell
-    var config = shell ? shell.shellConfig : null
-    return DenModel.layoutHas(config, id)
+    return DenModel.layoutHas(root.denLayout(), id)
   }
 
+  // config.plugins[] is not reachable at all under 4.0.3 (see denLayout()),
+  // so this can never see a widget parked there — always false. That only
+  // matters together with the write-path note on mutateConfig() below.
   function pluginsHasId(id) {
-    var shell = root.bar && root.bar.shell
-    var config = shell ? shell.shellConfig : null
-    return DenModel.pluginsHas(config, id)
+    return DenModel.pluginsHas(root.denLayout(), id)
   }
 
   function persistWidgets(list) {
@@ -2103,6 +2129,16 @@ BarWidget {
     })
   }
 
+  // Still present on the sandboxed PluginShellApi, but it always no-ops for
+  // Den: `_mutateBarConfig` (shell.qml) only invokes the mutator when
+  // `pluginHasBarCapabilities(manifest)` is true, which requires `"bar"` in
+  // the plugin's manifest `kinds` — a capability reserved for full
+  // alternative bar engines (plugins/bar/README.md), not ordinary
+  // bar-widget plugins. There is no sanctioned way for Den to request it.
+  // So every call below runs, changes nothing, and shell.json keeps
+  // whatever it already had — new tuck/eject actions do not persist.
+  // Verified directly against the installed shell.qml (2026-09-09); not
+  // yet reported upstream.
   function mutateConfig(mutator) {
     var shell = root.bar && root.bar.shell
     if (!shell || typeof shell.mutateShellConfig !== "function") return
@@ -2110,8 +2146,6 @@ BarWidget {
   }
 
   function removeFromLayoutAndKeepEnabled(key) {
-    var shell = root.bar && root.bar.shell
-    if (!shell || !shell.shellConfig) return
     var inLayout = root.layoutHasId(key)
     var inPlugins = root.pluginsHasId(key)
     if (!inLayout && inPlugins) return
@@ -2119,7 +2153,7 @@ BarWidget {
     // tucking a configured widget away never silently drops its settings.
     // Den-specific keys (widgets/icons) are not settings and stay behind.
     var carried = {}
-    var src = DenModel.findLayoutEntry(shell.shellConfig, key)
+    var src = DenModel.findLayoutEntry(root.denLayout(), key)
     if (src && typeof src === "object") {
       for (var sk in src) {
         if (sk !== "id" && sk !== "widgets" && sk !== "icons") carried[sk] = src[sk]
@@ -2157,8 +2191,6 @@ BarWidget {
   // release over the bar) it inserts exactly before/after it; without one it
   // lands at the right-section end, just before omarchy.power.
   function removeFromPluginsAndAddToLayout(key, region, anchorName, after) {
-    var shell = root.bar && root.bar.shell
-    if (!shell || !shell.shellConfig) return
     var inLayout = root.layoutHasId(key)
     var inPlugins = root.pluginsHasId(key)
     if (inLayout && !inPlugins) return
@@ -2166,7 +2198,7 @@ BarWidget {
     // the reverse of the tuck-away merge, so ejecting a widget never drops
     // its configured settings. Den's own list keys stay behind.
     var carried = {}
-    var src = DenModel.entrySettings(shell.shellConfig, key)
+    var src = DenModel.entrySettings(root.denLayout(), key)
     if (src) {
       for (var sk in src) {
         if (sk !== "widgets" && sk !== "icons") carried[sk] = src[sk]
@@ -2240,8 +2272,6 @@ BarWidget {
   }
 
   function ensureConfiguredEnabled(key) {
-    var shell = root.bar && root.bar.shell
-    if (!shell || !shell.shellConfig) return
     if (root.layoutHasId(key)) return
     if (root.pluginsHasId(key)) return
     root.mutateConfig(function(c) {
@@ -2255,9 +2285,15 @@ BarWidget {
     })
   }
 
-  property var reconcileRegistry: root.bar ? root.bar.shell.pluginRegistry : null
+  // No pluginRegistry reachable under 4.0.3 (see denLayout() above), so this
+  // always ends up null and the Connections block below can never fire —
+  // reconciliation still runs once via Component.onCompleted below, just not
+  // again on a registry change. Left as dead-but-harmless rather than
+  // removed, since the write it would trigger (syncHiddenFromLayout →
+  // ensureConfiguredEnabled → mutateConfig) already no-ops regardless.
+  property var reconcileRegistry: root.bar && root.bar.shell ? root.bar.shell.pluginRegistry : null
 
-  onBarChanged: root.reconcileRegistry = root.bar ? root.bar.shell.pluginRegistry : null
+  onBarChanged: root.reconcileRegistry = root.bar && root.bar.shell ? root.bar.shell.pluginRegistry : null
 
   Connections {
     target: root.reconcileRegistry
